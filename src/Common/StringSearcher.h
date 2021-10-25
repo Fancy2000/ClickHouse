@@ -116,9 +116,9 @@ public:
 
                 /// lower and uppercase variants of the first octet of the first character in `needle`
                 size_t length_l = UTF8::convertCodePointToUTF8(first_l_u32, l_seq, sizeof(l_seq));
-                size_t length_r = UTF8::convertCodePointToUTF8(first_u_u32, u_seq, sizeof(u_seq));
+                size_t length_u = UTF8::convertCodePointToUTF8(first_u_u32, u_seq, sizeof(u_seq));
 
-                if (length_l != length_r)
+                if (length_l != length_u)
                     throw Exception{"UTF8 sequences with different lowercase and uppercase lengths are not supported", ErrorCodes::UNSUPPORTED_PARAMETER};
             }
 
@@ -200,34 +200,48 @@ public:
             {
                 if (mask == cachemask)
                 {
-                    pos += cache_valid_len;
-                    auto needle_pos = needle + cache_valid_len;
-
-                    while (needle_pos < needle_end)
+                    const auto mask_offset_l = _mm_movemask_epi8(v_against_l);
+                    const auto mask_offset_u = _mm_movemask_epi8(v_against_u);
+                    bool match_l = mask_offset_l == cachemask;
+                    bool match_u = mask_offset_u == cachemask;
+                    if (likely(match_l || match_u))
                     {
-                        auto haystack_code_point = UTF8::convertUTF8ToCodePoint(pos, haystack_end - pos);
-                        auto needle_code_point = UTF8::convertUTF8ToCodePoint(needle_pos, needle_end - needle_pos);
+                        pos += cache_valid_len;
+                        auto needle_pos = needle + cache_valid_len;
 
-                        /// Invalid UTF-8, should not compare equals
-                        if (!haystack_code_point || !needle_code_point)
-                            break;
+                        while (needle_pos < needle_end)
+                        {
+                            auto haystack_code_point = UTF8::convertUTF8ToCodePoint(pos, haystack_end - pos);
+                            auto needle_code_point = UTF8::convertUTF8ToCodePoint(needle_pos, needle_end - needle_pos);
 
-                        /// Not equals case insensitive.
-                        if (Poco::Unicode::toLower(*haystack_code_point) != Poco::Unicode::toLower(*needle_code_point))
-                            break;
+                            /// Invalid UTF-8, should not compare equals
+                            if (!haystack_code_point || !needle_code_point)
+                                break;
 
-                        /// @note assuming sequences for lowercase and uppercase have exact same length (that is not always true)
-                        const auto len = UTF8::seqLength(*pos);
-                        pos += len;
-                        needle_pos += len;
+                            /// Not equals case insensitive.
+                            if (Poco::Unicode::toLower(*haystack_code_point) != Poco::Unicode::toLower(*needle_code_point))
+                                break;
+
+                            /// @note assuming sequences for lowercase and uppercase have exact same length (that is not always true)
+                            const auto len = UTF8::seqLength(*pos);
+                            pos += len;
+                            needle_pos += len;
+                        }
+
+                        if (needle_pos == needle_end)
+                            return true;
                     }
-
-                    if (needle_pos == needle_end)
-                        return true;
                 }
             }
             else if ((mask & cachemask) == cachemask)
-                return true;
+            {
+                const auto mask_offset_l = _mm_movemask_epi8(v_against_l);
+                const auto mask_offset_u = _mm_movemask_epi8(v_against_u);
+                bool match_l = (mask_offset_l & cachemask) == cachemask;
+                bool match_u = (mask_offset_u & cachemask) == cachemask;
+                if (likely(match_l || match_u))
+                    return true;
+            }
 
             return false;
         }
@@ -299,40 +313,54 @@ public:
                     const auto v_against_l_offset = _mm_cmpeq_epi8(v_haystack_offset, cachel);
                     const auto v_against_u_offset = _mm_cmpeq_epi8(v_haystack_offset, cacheu);
                     const auto v_against_l_or_u_offset = _mm_or_si128(v_against_l_offset, v_against_u_offset);
-                    const auto mask_offset = _mm_movemask_epi8(v_against_l_or_u_offset);
+                    const auto mask_offset_both = _mm_movemask_epi8(v_against_l_or_u_offset);
 
                     if (0xffff == cachemask)
                     {
-                        if (mask_offset == cachemask)
+                        if (mask_offset_both == cachemask)
                         {
-                            auto haystack_pos = haystack + cache_valid_len;
-                            auto needle_pos = needle + cache_valid_len;
-
-                            while (haystack_pos < haystack_end && needle_pos < needle_end)
+                            const auto mask_offset_l = _mm_movemask_epi8(v_against_l_offset);
+                            const auto mask_offset_u = _mm_movemask_epi8(v_against_u_offset);
+                            bool match_l = mask_offset_l == cachemask;
+                            bool match_u = mask_offset_u == cachemask;
+                            if (likely(match_l || match_u))
                             {
-                                auto haystack_code_point = UTF8::convertUTF8ToCodePoint(haystack_pos, haystack_end - haystack_pos);
-                                auto needle_code_point = UTF8::convertUTF8ToCodePoint(needle_pos, needle_end - needle_pos);
+                                auto haystack_pos = haystack + cache_valid_len;
+                                auto needle_pos = needle + cache_valid_len;
 
-                                /// Invalid UTF-8, should not compare equals
-                                if (!haystack_code_point || !needle_code_point)
-                                    break;
+                                while (haystack_pos < haystack_end && needle_pos < needle_end)
+                                {
+                                    auto haystack_code_point = UTF8::convertUTF8ToCodePoint(haystack_pos, haystack_end - haystack_pos);
+                                    auto needle_code_point = UTF8::convertUTF8ToCodePoint(needle_pos, needle_end - needle_pos);
 
-                                /// Not equals case insensitive.
-                                if (Poco::Unicode::toLower(*haystack_code_point) != Poco::Unicode::toLower(*needle_code_point))
-                                    break;
+                                    /// Invalid UTF-8, should not compare equals
+                                    if (!haystack_code_point || !needle_code_point)
+                                        break;
 
-                                /// @note assuming sequences for lowercase and uppercase have exact same length (that is not always true)
-                                const auto len = UTF8::seqLength(*haystack_pos);
-                                haystack_pos += len;
-                                needle_pos += len;
+                                    /// Not equals case insensitive.
+                                    if (Poco::Unicode::toLower(*haystack_code_point) != Poco::Unicode::toLower(*needle_code_point))
+                                        break;
+
+                                    /// @note assuming sequences for lowercase and uppercase have exact same length (that is not always true)
+                                    const auto len = UTF8::seqLength(*haystack_pos);
+                                    haystack_pos += len;
+                                    needle_pos += len;
+                                }
+
+                                if (needle_pos == needle_end)
+                                    return haystack;
                             }
-
-                            if (needle_pos == needle_end)
-                                return haystack;
                         }
                     }
-                    else if ((mask_offset & cachemask) == cachemask)
-                        return haystack;
+                    else if ((mask_offset_both & cachemask) == cachemask)
+                    {
+                        const auto mask_offset_l = _mm_movemask_epi8(v_against_l_offset);
+                        const auto mask_offset_u = _mm_movemask_epi8(v_against_u_offset);
+                        bool match_l = (mask_offset_l & cachemask) == cachemask;
+                        bool match_u = (mask_offset_u & cachemask) == cachemask;
+                        if (likely(match_l || match_u))
+                            return haystack;
+                    }
 
                     /// first octet was ok, but not the first 16, move to start of next sequence and reapply
                     haystack += UTF8::seqLength(*haystack);
@@ -455,21 +483,35 @@ public:
             {
                 if (mask == cachemask)
                 {
-                    pos += n;
-                    auto needle_pos = needle + n;
-
-                    while (needle_pos < needle_end && std::tolower(*pos) == std::tolower(*needle_pos))
+                    const auto mask_offset_l = _mm_movemask_epi8(v_against_l);
+                    const auto mask_offset_u = _mm_movemask_epi8(v_against_u);
+                    bool match_l = mask_offset_l == cachemask;
+                    bool match_u = mask_offset_u == cachemask;
+                    if (likely(match_l || match_u))
                     {
-                        ++pos;
-                        ++needle_pos;
-                    }
+                        pos += n;
+                        auto needle_pos = needle + n;
 
-                    if (needle_pos == needle_end)
-                        return true;
+                        while (needle_pos < needle_end && std::tolower(*pos) == std::tolower(*needle_pos))
+                        {
+                            ++pos;
+                            ++needle_pos;
+                        }
+
+                        if (needle_pos == needle_end)
+                            return true;
+                    }
                 }
             }
             else if ((mask & cachemask) == cachemask)
-                return true;
+            {
+                const auto mask_offset_l = _mm_movemask_epi8(v_against_l);
+                const auto mask_offset_u = _mm_movemask_epi8(v_against_u);
+                bool match_l = (mask_offset_l & cachemask) == cachemask;
+                bool match_u = (mask_offset_u & cachemask) == cachemask;
+                if (likely(match_l || match_u))
+                    return true;
+            }
 
             return false;
         }
@@ -532,22 +574,36 @@ public:
                     {
                         if (mask_offset == cachemask)
                         {
-                            auto haystack_pos = haystack + n;
-                            auto needle_pos = needle + n;
-
-                            while (haystack_pos < haystack_end && needle_pos < needle_end &&
-                                   std::tolower(*haystack_pos) == std::tolower(*needle_pos))
+                            const auto mask_offset_l = _mm_movemask_epi8(v_against_l_offset);
+                            const auto mask_offset_u = _mm_movemask_epi8(v_against_u_offset);
+                            bool match_l = mask_offset_l == cachemask;
+                            bool match_u = mask_offset_u == cachemask;
+                            if (likely(match_l || match_u))
                             {
-                                ++haystack_pos;
-                                ++needle_pos;
-                            }
+                                auto haystack_pos = haystack + n;
+                                auto needle_pos = needle + n;
 
-                            if (needle_pos == needle_end)
-                                return haystack;
+                                while (haystack_pos < haystack_end && needle_pos < needle_end
+                                       && std::tolower(*haystack_pos) == std::tolower(*needle_pos))
+                                {
+                                    ++haystack_pos;
+                                    ++needle_pos;
+                                }
+
+                                if (needle_pos == needle_end)
+                                    return haystack;
+                            }
                         }
                     }
                     else if ((mask_offset & cachemask) == cachemask)
-                        return haystack;
+                    {
+                        const auto mask_offset_l = _mm_movemask_epi8(v_against_l_offset);
+                        const auto mask_offset_u = _mm_movemask_epi8(v_against_u_offset);
+                        bool match_l = (mask_offset_l & cachemask) == cachemask;
+                        bool match_u = (mask_offset_u & cachemask) == cachemask;
+                        if (likely(match_l || match_u))
+                            return haystack;
+                    }
 
                     ++haystack;
                     continue;
